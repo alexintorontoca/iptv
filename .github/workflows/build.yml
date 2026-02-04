@@ -1,0 +1,101 @@
+name: IPTV Generator - Final
+
+# 触发方式：手动触发 + push main 分支
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1️⃣ 拉取代码
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      # 2️⃣ 安装 Node.js
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '20'
+
+      # 3️⃣ 安装依赖
+      - name: Install dependencies
+        run: npm install
+
+      # 4️⃣ 准备输出文件夹
+      - name: Prepare folders
+        run: |
+          mkdir -p public
+          mkdir -p cache
+
+      # 5️⃣ 生成 IPTV 文件
+      - name: Generate IPTV M3U and JSON
+        run: |
+          node <<'JS'
+          const fs = require('fs');
+          const path = require('path');
+          const axios = require('axios');
+
+          const inputDir = path.join(__dirname, 'channels');
+          const outputDir = path.join(__dirname, 'public');
+          const timeout = 5000;
+
+          const regions = {
+            cn: 'CN',
+            hk: 'HK',
+            tw: 'TW'
+          };
+
+          async function checkUrl(url) {
+            try {
+              const res = await axios.head(url, { timeout });
+              return res.status >= 200 && res.status < 400;
+            } catch { return false; }
+          }
+
+          async function generate(region, keyword) {
+            const files = fs.readdirSync(inputDir).filter(f => f.endsWith('.m3u'));
+            let m3uLines = ['#EXTM3U'];
+            let jsonList = [];
+
+            for (const file of files) {
+              const content = fs.readFileSync(path.join(inputDir, file), 'utf8');
+              const lines = content.split('\n');
+              for (let i = 0; i < lines.length; i++) {
+                const line = lines[i].trim();
+                if (line.startsWith('#EXTINF:') && line.toLowerCase().includes(keyword.toLowerCase())) {
+                  const urlLine = lines[i + 1] ? lines[i + 1].trim() : '';
+                  if (!urlLine) continue;
+
+                  const ok = await checkUrl(urlLine);
+                  if (!ok) continue;
+
+                  m3uLines.push(line);
+                  m3uLines.push(urlLine);
+
+                  jsonList.push({
+                    name: line.split(',')[1] || 'N/A',
+                    url: urlLine,
+                    'group-title': region.toUpperCase()
+                  });
+                }
+              }
+            }
+
+            fs.writeFileSync(path.join(outputDir, `${region}.m3u`), m3uLines.join('\n'), 'utf8');
+            fs.writeFileSync(path.join(outputDir, `${region}.json`), JSON.stringify(jsonList, null, 2), 'utf8');
+
+            console.log(`✅ ${region}.m3u and ${region}.json generated. Items: ${jsonList.length}`);
+          }
+
+          (async () => {
+            for (const [key, val] of Object.entries(regions)) {
+              await generate(key, val);
+            }
+            console.log('🎉 IPTV generation completed!');
+          })();
+          JS
