@@ -1,39 +1,35 @@
-name: IPTV Generator - Final
+name: Ultimate IPTV Generator Full
 
-# 触发方式：手动触发 + push main 分支
 on:
   workflow_dispatch:
   push:
     branches:
       - main
+  schedule:
+    - cron: '0 4 * * *'
 
 jobs:
   build:
     runs-on: ubuntu-latest
 
     steps:
-      # 1️⃣ 拉取代码
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v3
 
-      # 2️⃣ 安装 Node.js
-      - name: Setup Node.js
+      - name: Setup Node
         uses: actions/setup-node@v3
         with:
           node-version: '20'
 
-      # 3️⃣ 安装依赖
       - name: Install dependencies
         run: npm install
 
-      # 4️⃣ 准备输出文件夹
       - name: Prepare folders
         run: |
           mkdir -p public
           mkdir -p cache
 
-      # 5️⃣ 生成 IPTV 文件
-      - name: Generate IPTV M3U and JSON
+      - name: Generate Ultimate IPTV Sources
         run: |
           node <<'JS'
           const fs = require('fs');
@@ -42,60 +38,135 @@ jobs:
 
           const inputDir = path.join(__dirname, 'channels');
           const outputDir = path.join(__dirname, 'public');
+          const cacheDir = path.join(__dirname, 'cache');
           const timeout = 5000;
+          const concurrency = 20;
 
           const regions = {
-            cn: 'CN',
-            hk: 'HK',
-            tw: 'TW'
+            cn: ['CN','China','cctv'],
+            hk: ['HK','Hong Kong'],
+            tw: ['TW','Taiwan']
           };
 
-          async function checkUrl(url) {
-            try {
-              const res = await axios.head(url, { timeout });
-              return res.status >= 200 && res.status < 400;
-            } catch { return false; }
+          if (!fs.existsSync(outputDir)) fs.mkdirSync(outputDir);
+          if (!fs.existsSync(cacheDir)) fs.mkdirSync(cacheDir);
+
+          function sleep(ms){return new Promise(r=>setTimeout(r,ms));}
+
+          async function checkUrl(url){
+            try{
+              const resp = await axios.head(url,{timeout});
+              return resp.status>=200 && resp.status<400;
+            }catch{return false;}
           }
 
-          async function generate(region, keyword) {
-            const files = fs.readdirSync(inputDir).filter(f => f.endsWith('.m3u'));
-            let m3uLines = ['#EXTM3U'];
-            let jsonList = [];
+          function loadCache(region){
+            const f = path.join(cacheDir, `${region}-cache.json`);
+            if(fs.existsSync(f)) return JSON.parse(fs.readFileSync(f,'utf8'));
+            return {};
+          }
 
-            for (const file of files) {
-              const content = fs.readFileSync(path.join(inputDir, file), 'utf8');
+          function saveCache(region, cache){
+            fs.writeFileSync(path.join(cacheDir,`${region}-cache.json`),JSON.stringify(cache,null,2),'utf8');
+          }
+
+          async function processRegion(key, keywords){
+            let m3uLines=['#EXTM3U'];
+            let jsonList=[];
+            let failedList=[];
+            const cache = loadCache(key);
+            const files = fs.readdirSync(inputDir).filter(f=>f.endsWith('.m3u'));
+
+            for(const file of files){
+              const content = fs.readFileSync(path.join(inputDir,file),'utf8');
               const lines = content.split('\n');
-              for (let i = 0; i < lines.length; i++) {
-                const line = lines[i].trim();
-                if (line.startsWith('#EXTINF:') && line.toLowerCase().includes(keyword.toLowerCase())) {
-                  const urlLine = lines[i + 1] ? lines[i + 1].trim() : '';
-                  if (!urlLine) continue;
+              const tasks=[];
+              for(let i=0;i<lines.length;i++){
+                const line=lines[i].trim();
+                if(line.startsWith('#EXTINF:')){
+                  const matched=keywords.some(k=>line.toLowerCase().includes(k.toLowerCase()));
+                  if(!matched) continue;
+                  const urlLine=lines[i+1]?lines[i+1].trim():'';
+                  if(!urlLine) continue;
 
-                  const ok = await checkUrl(urlLine);
-                  if (!ok) continue;
+                  tasks.push(async ()=>{
+                    let ok;
+                    // 使用缓存
+                    if(cache[urlLine] && (Date.now()-cache[urlLine].lastChecked<24*60*60*1000)){
+                      ok=cache[urlLine].status;
+                    } else {
+                      ok=await checkUrl(urlLine);
+                      cache[urlLine]={status:ok,lastChecked:Date.now()};
+                    }
 
-                  m3uLines.push(line);
-                  m3uLines.push(urlLine);
+                    if(!ok){
+                      failedList.push(urlLine);
+                      return;
+                    }
 
-                  jsonList.push({
-                    name: line.split(',')[1] || 'N/A',
-                    url: urlLine,
-                    'group-title': region.toUpperCase()
+                    if(jsonList.some(j=>j.url===urlLine)) return;
+
+                    m3uLines.push(line);
+                    m3uLines.push(urlLine);
+
+                    const metaMatch=line.match(/tvg-id="(.*?)"/);
+                    const tvgId=metaMatch?metaMatch[1]:'';
+                    const nameMatch=line.match(/,(.*)$/);
+                    const name=nameMatch?nameMatch[1].trim():'';
+                    const logoMatch=line.match(/tvg-logo="(.*?)"/);
+                    const logo=logoMatch?logoMatch[1]:'';
+                    const groupMatch=line.match(/group-title="(.*?)"/);
+                    const group=groupMatch?groupMatch[1]:key.toUpperCase();
+
+                    // 自动替换备用源 (可自定义)
+                    const urlVariants=[urlLine]; // 可在此添加镜像源
+                    let finalUrl=urlVariants[0];
+                    for(const altUrl of urlVariants){
+                      const altOk=await checkUrl(altUrl);
+                      if(altOk){finalUrl=altUrl; break;}
+                    }
+
+                    jsonList.push({name,url:finalUrl,"tvg-id":tvgId,"tvg-logo":logo,"group-title":group,"lastChecked":cache[urlLine].lastChecked});
                   });
                 }
               }
+
+              for(let i=0;i<tasks.length;i+=concurrency){
+                await Promise.all(tasks.slice(i,i+concurrency).map(fn=>fn()));
+              }
             }
 
-            fs.writeFileSync(path.join(outputDir, `${region}.m3u`), m3uLines.join('\n'), 'utf8');
-            fs.writeFileSync(path.join(outputDir, `${region}.json`), JSON.stringify(jsonList, null, 2), 'utf8');
+            // 输出
+            fs.writeFileSync(path.join(outputDir,`${key}.m3u`),m3uLines.join('\n'),'utf8');
+            fs.writeFileSync(path.join(outputDir,`${key}.json`),JSON.stringify(jsonList,null,2),'utf8');
 
-            console.log(`✅ ${region}.m3u and ${region}.json generated. Items: ${jsonList.length}`);
+            const grouped={};
+            jsonList.forEach(item=>{
+              const g=item['group-title']||'Others';
+              if(!grouped[g]) grouped[g]=[];
+              grouped[g].push(item);
+            });
+            fs.writeFileSync(path.join(outputDir,`${key}-grouped.json`),JSON.stringify(grouped,null,2),'utf8');
+            if(failedList.length>0){
+              fs.writeFileSync(path.join(outputDir,`${key}-failed.txt`),failedList.join('\n'),'utf8');
+            }
+
+            saveCache(key,cache);
+            console.log(`Region ${key}: ${jsonList.length} valid channels, ${failedList.length} failed`);
           }
 
-          (async () => {
-            for (const [key, val] of Object.entries(regions)) {
-              await generate(key, val);
+          (async ()=>{
+            for(const [key,keywords] of Object.entries(regions)){
+              await processRegion(key,keywords);
+              await sleep(500);
             }
-            console.log('🎉 IPTV generation completed!');
           })();
           JS
+
+      - name: Commit & Push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add public/ cache/
+          git commit -m "Auto-generate ultimate IPTV files [skip ci]" || echo "No changes"
+          git push
